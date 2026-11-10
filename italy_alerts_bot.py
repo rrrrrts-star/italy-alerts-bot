@@ -50,7 +50,8 @@ RSS_FEEDS = [
     "https://www.tagesschau.de/xml/rss2/",                      # Tagesschau (ARD)
     "https://www.spiegel.de/schlagzeilen/index.rss",            # Der Spiegel
     "https://www.welt.de/feeds/latest.rss",                     # Die Welt
-    "https://www.faz.net/rss/aktuell/politik/",                 # FAZ - פוליטיקה
+    "https://www.faz.net/rss/aktuell/politik/",                 # FAZ - פוליטיקה (נבדק: כרגע מחזיר ריק, יש אבחון בלוג)
+    "https://www.deutschlandfunk.de/politikportal-100.rss",     # Deutschlandfunk - פוליטיקה (רדיו ציבורי)
     # (Zentralrat der Juden הוסר - השרת חוסם/לא זמין באופן עקבי)
     # יוון - בשפה המקומית (יוונית)
     "https://www.tanea.gr/feed/",                                # TA NEA
@@ -81,7 +82,10 @@ FALLBACK_KEYWORDS = [
     "δικτυο bot", "ψευτικοι λογαριασμοι",
 ]
 
-SEEN_LINKS_FILE = Path("seen_links.json")
+# אם מחובר דיסק קבוע (Volume) ב-Railway, הוא מסופק במשתנה RAILWAY_VOLUME_MOUNT_PATH והקובץ נשמר עליו
+# ולכן שורד פריסות. בלי דיסק - הקובץ נשמר בתיקייה הרגילה ונמחק בכל פריסה.
+VOLUME_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+SEEN_LINKS_FILE = Path(VOLUME_PATH or ".") / "seen_links.json"
 POLL_INTERVAL_SECONDS = 120
 MAX_SEEN_LINKS = 5000
 IMPORTANCE_THRESHOLD = "low"
@@ -96,23 +100,29 @@ logging.basicConfig(
 logger = logging.getLogger("italy_alerts_bot")
 
 
-def load_seen_links() -> set:
+def load_seen_links() -> dict:
+    """מחזיר מילון מסודר (לפי סדר ההוספה) - מפתחות הם קישורים. המסודר חשוב כדי שבחיתוך יימחקו הישנים."""
     if SEEN_LINKS_FILE.exists():
         try:
             with open(SEEN_LINKS_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
+                return dict.fromkeys(json.load(f), True)
         except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"לא הצלחתי לטעון seen_links.json ({e}), מתחיל מרשימה ריקה")
-    return set()
+            logger.warning(f"לא הצלחתי לטעון {SEEN_LINKS_FILE.name} ({e}), מתחיל מרשימה ריקה")
+    return {}
 
 
-def save_seen_links(seen_links: set):
+def save_seen_links(seen_links: dict):
+    # חיתוך: מוחקים את הקישורים הישנים ביותר (הראשונים במילון)
+    while len(seen_links) > MAX_SEEN_LINKS:
+        del seen_links[next(iter(seen_links))]
     try:
-        links_to_save = list(seen_links)[-MAX_SEEN_LINKS:]
-        with open(SEEN_LINKS_FILE, "w", encoding="utf-8") as f:
-            json.dump(links_to_save, f, ensure_ascii=False)
+        SEEN_LINKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SEEN_LINKS_FILE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(seen_links), f, ensure_ascii=False)
+        os.replace(tmp, SEEN_LINKS_FILE)  # החלפה אטומית: קובץ לא יישאר חצי-כתוב אם התהליך נעצר באמצע
     except OSError as e:
-        logger.error(f"נכשל בשמירת seen_links.json: {e}")
+        logger.error(f"נכשל בשמירת {SEEN_LINKS_FILE.name}: {e}")
 
 
 def strip_html(text: str) -> str:
@@ -136,6 +146,7 @@ SOURCE_INFO = {
     "spiegel.de": {"flag": "🇩🇪", "country": "גרמניה", "source_name": "Der Spiegel"},
     "welt.de": {"flag": "🇩🇪", "country": "גרמניה", "source_name": "Die Welt"},
     "faz.net": {"flag": "🇩🇪", "country": "גרמניה", "source_name": "FAZ"},
+    "deutschlandfunk.de": {"flag": "🇩🇪", "country": "גרמניה", "source_name": "Deutschlandfunk"},
     "zentralratderjuden.de": {"flag": "🕎", "country": "קהילה יהודית - גרמניה", "source_name": "Zentralrat der Juden"},
     "tanea.gr": {"flag": "🇬🇷", "country": "יוון", "source_name": "TA NEA"},
     "politis.com.cy": {"flag": "🇨🇾", "country": "קפריסין", "source_name": "Politis"},
@@ -488,6 +499,9 @@ def is_recent_enough(entry) -> bool:
         return True
 
 
+_diagnosed_feeds = set()  # כדי לרשום אבחון על פיד תקול פעם אחת בלבד ולא בכל סבב
+
+
 def fetch_feed(feed_url: str):
     """
     מוריד RSS דרך requests עם timeout אמיתי, ורק אז מעביר ל-feedparser לפענוח.
@@ -504,7 +518,15 @@ def fetch_feed(feed_url: str):
         },
     )
     resp.raise_for_status()
-    return feedparser.parse(resp.content)
+    feed = feedparser.parse(resp.content)
+    if not feed.entries and feed_url not in _diagnosed_feeds:
+        _diagnosed_feeds.add(feed_url)
+        snippet = resp.text[:150].replace("\n", " ")
+        logger.warning(
+            f"אבחון פיד ריק {feed_url}: סטטוס {resp.status_code}, "
+            f"סוג תוכן {resp.headers.get('content-type')}, תחילת התוכן: {snippet}"
+        )
+    return feed
 
 
 # ---------- סינון מקדים (חיסכון בעלויות) - כתבות שלא נשלחות ל-Claude בכלל ----------
@@ -536,7 +558,7 @@ def is_junk_title(title: str, summary: str = "") -> bool:
     return not fallback_is_important(title, summary)  # שכבת ביטחון: מילת נושא = לא מסננים
 
 
-def check_feeds(seen_links: set):
+def check_feeds(seen_links: dict):
     new_entries = []
     skipped_junk = 0
 
@@ -559,7 +581,7 @@ def check_feeds(seen_links: set):
             if not link or link in seen_links:
                 continue
 
-            seen_links.add(link)
+            seen_links[link] = True
 
             if not is_recent_enough(entry):
                 continue
@@ -639,6 +661,10 @@ def run():
 
     seen_links = load_seen_links()
     logger.info(f"הבוט עלה. {len(seen_links)} קישורים ידועים מהרצות קודמות")
+    if VOLUME_PATH:
+        logger.info(f"דיסק קבוע מחובר - הזיכרון נשמר ב-{SEEN_LINKS_FILE}")
+    else:
+        logger.warning("אין דיסק קבוע מחובר - הזיכרון יימחק בכל פריסה (יגרום להודעות חוזרות)")
 
     while True:
         try:
